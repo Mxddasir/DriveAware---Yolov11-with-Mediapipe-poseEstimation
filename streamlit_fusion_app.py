@@ -46,6 +46,26 @@ def _get_sample_image_paths() -> List[Path]:
     return sorted(paths, key=lambda p: p.name)
 
 
+def _get_sample_images_with_labels() -> List[Tuple[Path, str]]:
+    """Return list of (path, friendly_name) for sample images. Names are 'Photo 1', 'Photo 2', etc."""
+    paths = _get_sample_image_paths()
+    return [(p, f"Photo {i + 1}") for i, p in enumerate(paths)]
+
+
+def _load_thumbnail(path: Path, max_width: int = 160) -> np.ndarray:
+    """Load image from path and resize to thumbnail (RGB for display). Returns None on failure."""
+    frame = cv2.imread(str(path))
+    if frame is None:
+        return None
+    h, w = frame.shape[:2]
+    if w > max_width:
+        scale = max_width / w
+        new_w = max_width
+        new_h = int(h * scale)
+        frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
 # ─── single image pipeline (streamlit version, no cv2 windows) ───
 
 def _process_single_image_bgr(
@@ -1125,26 +1145,43 @@ def main():
                     st.image(annotated_rgb, caption="Detection result", use_container_width=True)
 
         elif image_source == "Choose from sample images":
-            sample_paths = _get_sample_image_paths()
-            if not sample_paths:
+            samples = _get_sample_images_with_labels()
+            if not samples:
                 st.info("No sample images found in the Testing images folder.")
             else:
-                filenames = [p.name for p in sample_paths]
+                friendly_names = [label for _, label in samples]
+                path_by_name = {label: path for path, label in samples}
+
+                st.caption("Preview — select one or more below to run detection.")
+                cols_per_row = 4
+                for i in range(0, len(samples), cols_per_row):
+                    row = st.columns(cols_per_row)
+                    for j, col in enumerate(row):
+                        idx = i + j
+                        if idx >= len(samples):
+                            break
+                        path, label = samples[idx]
+                        thumb = _load_thumbnail(path)
+                        if thumb is not None:
+                            col.image(thumb, caption=label, use_container_width=True)
+                        else:
+                            col.caption(label)
+
                 selected = st.multiselect(
-                    "Select one or more sample images",
-                    filenames,
-                    help=f"{len(filenames)} sample image(s) available.",
+                    "Select one or more sample images to analyse",
+                    friendly_names,
+                    help=f"{len(friendly_names)} sample image(s) available.",
                 )
                 if selected:
-                    for name in selected:
-                        path = SAMPLE_IMAGES_DIR / name
-                        if not path.is_file():
+                    for label in selected:
+                        path = path_by_name.get(label)
+                        if path is None or not path.is_file():
                             continue
-                        st.markdown(f"**File:** `{name}`")
-                        with st.spinner(f"Processing {name}..."):
+                        st.markdown(f"**{label}**")
+                        with st.spinner(f"Processing {label}..."):
                             frame_bgr = cv2.imread(str(path))
                             if frame_bgr is None:
-                                st.warning(f"Could not read image: {name}")
+                                st.warning(f"Could not read image: {label}")
                                 continue
                             annotated_bgr, _ = _process_single_image_bgr(
                                 frame_bgr=frame_bgr,
@@ -1158,7 +1195,7 @@ def main():
                                 draw_pose=draw_pose,
                             )
                             annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-                            st.image(annotated_rgb, caption=f"Detection result - {name}", use_container_width=True)
+                            st.image(annotated_rgb, caption=f"Detection result — {label}", use_container_width=True)
 
         else:
             uploaded_files = st.file_uploader(
