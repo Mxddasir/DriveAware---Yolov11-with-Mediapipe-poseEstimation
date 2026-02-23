@@ -30,6 +30,21 @@ try:
 except Exception:
     REPORTLAB_AVAILABLE = False
 
+# Sample images directory (relative to this file)
+SAMPLE_IMAGES_DIR = Path(__file__).resolve().parent / "Testing images"
+SAMPLE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def _get_sample_image_paths() -> List[Path]:
+    """Return sorted list of image paths in SAMPLE_IMAGES_DIR, or empty if missing/empty."""
+    if not SAMPLE_IMAGES_DIR.is_dir():
+        return []
+    paths = [
+        p for p in SAMPLE_IMAGES_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in SAMPLE_IMAGE_EXTENSIONS
+    ]
+    return sorted(paths, key=lambda p: p.name)
+
 
 # ─── single image pipeline (streamlit version, no cv2 windows) ───
 
@@ -1079,23 +1094,22 @@ def main():
         st.error(f"Could not load YOLO model from `{phone_model_path}`.\n\nError: {e}")
         return
 
-    # ── image upload mode ──
+    # ── image mode (take photo, upload, or sample images) ──
     if mode == "Upload image(s)":
-        st.subheader("Upload images to test")
-        uploaded_files = st.file_uploader(
-            "Upload one or more images",
-            type=["jpg", "jpeg", "png", "bmp", "webp"],
-            accept_multiple_files=True,
+        st.subheader("Take a photo or upload images")
+        image_source = st.radio(
+            "Image source",
+            ["Take a photo", "Upload image(s)", "Choose from sample images"],
+            help="Use your camera, upload files, or pick from sample images to test.",
         )
 
-        if uploaded_files:
-            for up in uploaded_files:
-                st.markdown(f"**File:** `{up.name}`")
-                with st.spinner(f"Processing {up.name}..."):
-                    pil_img = Image.open(up).convert("RGB")
+        if image_source == "Take a photo":
+            cam_img = st.camera_input("Take a photo to analyse")
+            if cam_img is not None:
+                with st.spinner("Running detection..."):
+                    pil_img = Image.open(cam_img).convert("RGB")
                     frame_rgb = np.array(pil_img)
                     frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
                     annotated_bgr, _ = _process_single_image_bgr(
                         frame_bgr=frame_bgr,
                         phone_model=phone_model,
@@ -1107,20 +1121,84 @@ def main():
                         require_hand_proximity=require_hand_proximity,
                         draw_pose=draw_pose,
                     )
-
                     annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-                    st.image(annotated_rgb, caption=f"Detection result - {up.name}", use_container_width=True)
+                    st.image(annotated_rgb, caption="Detection result", use_container_width=True)
 
-    # ── video upload mode ──
+        elif image_source == "Choose from sample images":
+            sample_paths = _get_sample_image_paths()
+            if not sample_paths:
+                st.info("No sample images found in the Testing images folder.")
+            else:
+                filenames = [p.name for p in sample_paths]
+                selected = st.multiselect(
+                    "Select one or more sample images",
+                    filenames,
+                    help=f"{len(filenames)} sample image(s) available.",
+                )
+                if selected:
+                    for name in selected:
+                        path = SAMPLE_IMAGES_DIR / name
+                        if not path.is_file():
+                            continue
+                        st.markdown(f"**File:** `{name}`")
+                        with st.spinner(f"Processing {name}..."):
+                            frame_bgr = cv2.imread(str(path))
+                            if frame_bgr is None:
+                                st.warning(f"Could not read image: {name}")
+                                continue
+                            annotated_bgr, _ = _process_single_image_bgr(
+                                frame_bgr=frame_bgr,
+                                phone_model=phone_model,
+                                pose_task_path=pose_task_path,
+                                conf_high=conf_high,
+                                conf_low=conf_low,
+                                hand_face_thresh=hand_face_thresh,
+                                hand_phone_thresh=hand_phone_thresh,
+                                require_hand_proximity=require_hand_proximity,
+                                draw_pose=draw_pose,
+                            )
+                            annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+                            st.image(annotated_rgb, caption=f"Detection result - {name}", use_container_width=True)
+
+        else:
+            uploaded_files = st.file_uploader(
+                "Upload one or more images",
+                type=["jpg", "jpeg", "png", "bmp", "webp"],
+                accept_multiple_files=True,
+            )
+
+            if uploaded_files:
+                for up in uploaded_files:
+                    st.markdown(f"**File:** `{up.name}`")
+                    with st.spinner(f"Processing {up.name}..."):
+                        pil_img = Image.open(up).convert("RGB")
+                        frame_rgb = np.array(pil_img)
+                        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                        annotated_bgr, _ = _process_single_image_bgr(
+                            frame_bgr=frame_bgr,
+                            phone_model=phone_model,
+                            pose_task_path=pose_task_path,
+                            conf_high=conf_high,
+                            conf_low=conf_low,
+                            hand_face_thresh=hand_face_thresh,
+                            hand_phone_thresh=hand_phone_thresh,
+                            require_hand_proximity=require_hand_proximity,
+                            draw_pose=draw_pose,
+                        )
+                        annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+                        st.image(annotated_rgb, caption=f"Detection result - {up.name}", use_container_width=True)
+
+    # ── video mode (take video then upload, or upload) ──
     elif mode == "Upload video":
-        st.subheader("Upload a recorded video")
+        st.subheader("Take a video or upload one")
         st.markdown(
-            "Upload a driving or classroom recording. The system will analyse the entire video, "
+            "**Take a video** on your phone or device, then **upload it** below. "
+            "Or choose an existing video file. The system will analyse the entire video, "
             "identify periods of active phone use, and generate a drive-style report at the end."
         )
 
         video_file = st.file_uploader(
-            "Upload a video file",
+            "Upload a video file (e.g. one you just recorded)",
             type=["mp4", "mov", "avi", "mkv", "webm"],
             accept_multiple_files=False,
         )
