@@ -1,3 +1,4 @@
+import math
 import os
 import platform
 import tempfile
@@ -21,7 +22,7 @@ from utils.visualization import Visualizer
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.vision.core.image import Image as MpImage, ImageFormat as MpImageFormat
 
-# try importing reportlab for pdf generation - its optional
+# importing reportlab for pdf generation 
 try:
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
@@ -34,7 +35,7 @@ except Exception:
 SAMPLE_IMAGES_DIR = Path(__file__).resolve().parent / "Testing images"
 SAMPLE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-# Default weight paths for Evaluation tab (v11 = main weights, v8 = weightsv8, v5 = weightsv5)
+# weight paths for Evaluation tab (v11 = main weights, v8 = weightsv8, v5 = weightsv5)
 EVAL_MODELS = {
     "YOLO v11": "weights/best.pt",
     "YOLO v8": "weights/weightsv8/best.pt",
@@ -73,6 +74,22 @@ def _load_thumbnail(path: Path, max_width: int = 160) -> np.ndarray:
         new_w = max_width
         new_h = int(h * scale)
         frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
+def _load_video_thumbnail(path: Path, max_width: int = 160) -> np.ndarray:
+    """Read first frame of a video and return as an RGB thumbnail. Returns None on failure."""
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return None
+    ret, frame = cap.read()
+    cap.release()
+    if not ret or frame is None:
+        return None
+    h, w = frame.shape[:2]
+    if w > max_width:
+        scale = max_width / w
+        frame = cv2.resize(frame, (max_width, int(h * scale)), interpolation=cv2.INTER_AREA)
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
 
@@ -1357,6 +1374,10 @@ def _run_evaluation(
                 "Recall": f"{recall:.1%}",
                 "F1 Score": f"{f1:.1%}",
                 "Avg inference (ms)": f"{avg_ms:.0f}" if not np.isnan(avg_ms) else "N/A",
+                "True Positive": tp,
+                "True Negative": tn,
+                "False Positive": fp,
+                "False Negative": fn,
                 "Correct": correct_count,
                 "Incorrect": incorrect_count,
             })
@@ -1369,7 +1390,7 @@ def _run_evaluation(
         with res_tab_summary:
             st.subheader("Summary comparison")
             summary_df = pd.DataFrame(summary_rows)
-            st.dataframe(summary_df.set_index("Model"), use_container_width=True, height=120)
+            st.dataframe(summary_df.set_index("Model"), use_container_width=True, height=50 + 36 * len(summary_rows))
 
             st.markdown("---")
             all_rows = []
@@ -1439,7 +1460,58 @@ def _run_evaluation(
                 comp_dict[f"Actual ({mn})"] = [r["Actual"] for r in results_by_model[mn]]
                 comp_dict[f"Correct ({mn})"] = [r["Correct"] for r in results_by_model[mn]]
             comp_df = pd.DataFrame(comp_dict)
-            st.dataframe(comp_df, use_container_width=True, height=400)
+
+            # ── Search + page-size controls ──
+            pcol_search, pcol_size = st.columns([3, 1])
+            with pcol_search:
+                perim_search = st.text_input(
+                    "Filter by image name",
+                    value="",
+                    placeholder="e.g. img_123…",
+                    label_visibility="collapsed",
+                    key="perim_search_input",
+                )
+            with pcol_size:
+                perim_page_size = st.selectbox("Per page", [10, 25, 50, 100], index=1, key="perim_page_size_sel")
+
+            # filter rows
+            if perim_search.strip():
+                mask = comp_df["Image"].str.contains(perim_search.strip(), case=False, na=False)
+                filtered_comp_df = comp_df[mask]
+            else:
+                filtered_comp_df = comp_df
+
+            total_perim = len(filtered_comp_df)
+            n_perim_pages = max(1, math.ceil(total_perim / perim_page_size))
+
+            # reset page when search or page size changes
+            if (perim_search != st.session_state.get("_perim_prev_search", "")
+                    or perim_page_size != st.session_state.get("_perim_prev_size", perim_page_size)):
+                st.session_state["perim_page"] = 0
+            st.session_state["_perim_prev_search"] = perim_search
+            st.session_state["_perim_prev_size"] = perim_page_size
+
+            if "perim_page" not in st.session_state:
+                st.session_state["perim_page"] = 0
+            perim_page = max(0, min(st.session_state["perim_page"], n_perim_pages - 1))
+            st.session_state["perim_page"] = perim_page
+
+            p_start = perim_page * perim_page_size
+            p_end = min(p_start + perim_page_size, total_perim)
+            page_comp_df = filtered_comp_df.iloc[p_start:p_end]
+
+            st.caption(f"Showing rows {p_start + 1}–{p_end} of {total_perim} · Page {perim_page + 1} of {n_perim_pages}")
+            st.dataframe(page_comp_df, use_container_width=True, hide_index=True)
+
+            pbtn_prev, _, pbtn_next = st.columns([1, 5, 1])
+            with pbtn_prev:
+                if st.button("← Previous", disabled=(perim_page == 0), key="perim_prev_btn"):
+                    st.session_state["perim_page"] = perim_page - 1
+                    st.rerun()
+            with pbtn_next:
+                if st.button("Next →", disabled=(perim_page >= n_perim_pages - 1), key="perim_next_btn"):
+                    st.session_state["perim_page"] = perim_page + 1
+                    st.rerun()
 
             st.markdown("---")
             for model_name in model_names:
@@ -1462,6 +1534,7 @@ def _run_evaluation(
                 "and click an image to view it."
             )
             cols_incorrect = ["Image", "Expected", "Actual", "Confidence", "Reason", "Inference (ms)"]
+            ERR_IMG_PAGE_SIZE = 10
             for model_name in model_names:
                 df = pd.DataFrame(results_by_model[model_name])
                 incorrect_df = df[df["Correct"] == "No"]
@@ -1476,8 +1549,34 @@ def _run_evaluation(
                             height=min(260, 50 + 30 * len(incorrect_df)),
                         )
 
-                        st.markdown("Click an image row below to view the corresponding photo.")
-                        for _, row in incorrect_df.iterrows():
+                        st.markdown("---")
+                        # pagination for image previews
+                        total_err = len(incorrect_df)
+                        n_err_pages = max(1, math.ceil(total_err / ERR_IMG_PAGE_SIZE))
+                        err_page_key = f"err_page_{model_name.replace(' ', '_')}"
+                        if err_page_key not in st.session_state:
+                            st.session_state[err_page_key] = 0
+                        err_page = max(0, min(st.session_state[err_page_key], n_err_pages - 1))
+                        st.session_state[err_page_key] = err_page
+
+                        e_start = err_page * ERR_IMG_PAGE_SIZE
+                        e_end = min(e_start + ERR_IMG_PAGE_SIZE, total_err)
+                        st.caption(f"Image previews: {e_start + 1}–{e_end} of {total_err} · Page {err_page + 1} of {n_err_pages}")
+
+                        ebtn_prev_key = f"err_prev_{model_name.replace(' ', '_')}"
+                        ebtn_next_key = f"err_next_{model_name.replace(' ', '_')}"
+                        ecol_prev, _, ecol_next = st.columns([1, 5, 1])
+                        with ecol_prev:
+                            if st.button("← Previous", disabled=(err_page == 0), key=ebtn_prev_key):
+                                st.session_state[err_page_key] = err_page - 1
+                                st.rerun()
+                        with ecol_next:
+                            if st.button("Next →", disabled=(err_page >= n_err_pages - 1), key=ebtn_next_key):
+                                st.session_state[err_page_key] = err_page + 1
+                                st.rerun()
+
+                        page_incorrect = incorrect_df.iloc[e_start:e_end]
+                        for _, row in page_incorrect.iterrows():
                             img_name = row.get("Image")
                             if not img_name:
                                 continue
@@ -1602,28 +1701,81 @@ def main():
             if not samples:
                 st.info("No sample images found in the Testing images folder.")
             else:
-                friendly_names = [label for _, label in samples]
-                path_by_name = {label: path for path, label in samples}
+                # ── Search + page-size controls ──
+                col_search, col_size = st.columns([3, 1])
+                with col_search:
+                    search_term = st.text_input(
+                        "Search images",
+                        value="",
+                        placeholder="Filter by name…",
+                        label_visibility="collapsed",
+                        key="img_sample_search_input",
+                    )
+                with col_size:
+                    page_size = st.selectbox("Per page", [10, 20, 30, 50], index=1, key="img_sample_page_size_sel")
 
-                st.caption("Preview — select one or more below to run detection.")
+                # filter by search term
+                if search_term.strip():
+                    term = search_term.strip().lower()
+                    filtered = [(p, lbl) for p, lbl in samples if term in lbl.lower() or term in p.name.lower()]
+                else:
+                    filtered = samples
+
+                total = len(filtered)
+                n_pages = max(1, math.ceil(total / page_size))
+
+                # reset page when search or page size changes
+                prev_search = st.session_state.get("_img_prev_search", "")
+                prev_size = st.session_state.get("_img_prev_size", page_size)
+                if search_term != prev_search or page_size != prev_size:
+                    st.session_state["img_sample_page"] = 0
+                st.session_state["_img_prev_search"] = search_term
+                st.session_state["_img_prev_size"] = page_size
+
+                if "img_sample_page" not in st.session_state:
+                    st.session_state["img_sample_page"] = 0
+                page = max(0, min(st.session_state["img_sample_page"], n_pages - 1))
+                st.session_state["img_sample_page"] = page
+
+                start = page * page_size
+                end = min(start + page_size, total)
+                page_samples = filtered[start:end]
+
+                st.caption(f"Showing {start + 1}–{end} of {total} image(s) · Page {page + 1} of {n_pages}")
+
+                # thumbnail grid for current page
                 cols_per_row = 4
-                for i in range(0, len(samples), cols_per_row):
+                for i in range(0, len(page_samples), cols_per_row):
                     row = st.columns(cols_per_row)
                     for j, col in enumerate(row):
                         idx = i + j
-                        if idx >= len(samples):
+                        if idx >= len(page_samples):
                             break
-                        path, label = samples[idx]
+                        path, label = page_samples[idx]
                         thumb = _load_thumbnail(path)
                         if thumb is not None:
                             col.image(thumb, caption=label, use_container_width=True)
                         else:
                             col.caption(label)
 
+                # Previous / Next pagination buttons
+                btn_prev, _, btn_next = st.columns([1, 5, 1])
+                with btn_prev:
+                    if st.button("← Previous", disabled=(page == 0), key="img_prev_btn"):
+                        st.session_state["img_sample_page"] = page - 1
+                        st.rerun()
+                with btn_next:
+                    if st.button("Next →", disabled=(page >= n_pages - 1), key="img_next_btn"):
+                        st.session_state["img_sample_page"] = page + 1
+                        st.rerun()
+
+                # multiselect from ALL filtered results (not just current page)
+                friendly_names = [lbl for _, lbl in filtered]
+                path_by_name = {lbl: p for p, lbl in filtered}
                 selected = st.multiselect(
                     "Select one or more sample images to analyse",
                     friendly_names,
-                    help=f"{len(friendly_names)} sample image(s) available.",
+                    help=f"{total} image(s) match the current filter.",
                 )
                 if selected:
                     for label in selected:
@@ -1719,13 +1871,54 @@ def main():
             if not sample_videos:
                 st.info("No sample videos available.")
             else:
-                video_labels = [label for _, label in sample_videos]
-                video_path_by_label = {label: path for path, label in sample_videos}
+                VID_PAGE_SIZE = 5
+                total_vids = len(sample_videos)
+                n_vid_pages = max(1, math.ceil(total_vids / VID_PAGE_SIZE))
 
+                if "vid_sample_page" not in st.session_state:
+                    st.session_state["vid_sample_page"] = 0
+                vid_page = max(0, min(st.session_state["vid_sample_page"], n_vid_pages - 1))
+                st.session_state["vid_sample_page"] = vid_page
+
+                v_start = vid_page * VID_PAGE_SIZE
+                v_end = min(v_start + VID_PAGE_SIZE, total_vids)
+                page_videos = sample_videos[v_start:v_end]
+
+                st.caption(f"Showing {v_start + 1}–{v_end} of {total_vids} video(s) · Page {vid_page + 1} of {n_vid_pages}")
+
+                # first-frame thumbnail grid for current page
+                cols_per_row = 4
+                for i in range(0, len(page_videos), cols_per_row):
+                    row = st.columns(cols_per_row)
+                    for j, col in enumerate(row):
+                        idx = i + j
+                        if idx >= len(page_videos):
+                            break
+                        path, label = page_videos[idx]
+                        thumb = _load_video_thumbnail(path)
+                        if thumb is not None:
+                            col.image(thumb, caption=label, use_container_width=True)
+                        else:
+                            col.caption(f"{label}\n(no preview)")
+
+                # Previous / Next pagination buttons
+                vbtn_prev, _, vbtn_next = st.columns([1, 5, 1])
+                with vbtn_prev:
+                    if st.button("← Previous", disabled=(vid_page == 0), key="vid_prev_btn"):
+                        st.session_state["vid_sample_page"] = vid_page - 1
+                        st.rerun()
+                with vbtn_next:
+                    if st.button("Next →", disabled=(vid_page >= n_vid_pages - 1), key="vid_next_btn"):
+                        st.session_state["vid_sample_page"] = vid_page + 1
+                        st.rerun()
+
+                # select from visible page only
+                page_video_labels = [lbl for _, lbl in page_videos]
+                video_path_by_label = {lbl: p for p, lbl in page_videos}
                 selected_video = st.selectbox(
                     "Select a sample video to analyse",
-                    video_labels,
-                    help=f"{len(video_labels)} sample video(s) available.",
+                    page_video_labels,
+                    help=f"Showing {len(page_video_labels)} video(s) on this page.",
                 )
                 if selected_video and st.button("Analyse selected video"):
                     video_path = video_path_by_label[selected_video]
