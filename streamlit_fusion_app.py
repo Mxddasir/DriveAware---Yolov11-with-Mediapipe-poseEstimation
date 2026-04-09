@@ -34,6 +34,16 @@ except Exception:
 SAMPLE_IMAGES_DIR = Path(__file__).resolve().parent / "Testing images"
 SAMPLE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
+# Default weight paths for Evaluation tab (v11 = main weights, v8 = weightsv8, v5 = weightsv5)
+EVAL_MODELS = {
+    "YOLO v11": "weights/best.pt",
+    "YOLO v8": "weights/weightsv8/best.pt",
+    "YOLO v5": "weights/weightsv5/best.pt",
+}
+
+SAMPLE_VIDEOS_DIR = Path(__file__).resolve().parent / "Testing videos"
+SAMPLE_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
 
 def _get_sample_image_paths() -> List[Path]:
     """Return sorted list of image paths in SAMPLE_IMAGES_DIR, or empty if missing/empty."""
@@ -66,6 +76,35 @@ def _load_thumbnail(path: Path, max_width: int = 160) -> np.ndarray:
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
 
+def _get_sample_video_paths() -> List[Path]:
+    """Return sorted list of video paths in SAMPLE_VIDEOS_DIR, or empty if missing/empty."""
+    if not SAMPLE_VIDEOS_DIR.is_dir():
+        return []
+    paths = [
+        p for p in SAMPLE_VIDEOS_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in SAMPLE_VIDEO_EXTENSIONS
+    ]
+    return sorted(paths, key=lambda p: p.name)
+
+
+def _get_sample_videos_with_labels() -> List[Tuple[Path, str]]:
+    """Return list of (path, friendly_name) for sample videos. Names are 'Video 1', 'Video 2', etc."""
+    paths = _get_sample_video_paths()
+    return [(p, f"Video {i + 1}") for i, p in enumerate(paths)]
+
+
+class _SampleVideo:
+    """Thin adapter so a Path can be passed to _analyze_video_file_streamlit unchanged.
+    Mimics the .name and .getvalue() interface of st.UploadedFile."""
+
+    def __init__(self, path: Path):
+        self.name = path.name
+        self._path = path
+
+    def getvalue(self) -> bytes:
+        return self._path.read_bytes()
+
+
 # ─── single image pipeline (streamlit version, no cv2 windows) ───
 
 def _process_single_image_bgr(
@@ -81,8 +120,10 @@ def _process_single_image_bgr(
 ):
     H, W = frame_bgr.shape[:2]
 
-    # high confidence yolo pass
+    # ── stage 1: YOLO high-confidence inference ──
+    _t = time.time()
     det_high, boxes_high, _ = phone_model.detect(frame_bgr, conf_high)
+    yolo_high_ms = (time.time() - _t) * 1000
     found_high = boxes_high.shape[0] > 0
 
     # defaults
@@ -96,42 +137,64 @@ def _process_single_image_bgr(
 
     need_pose = draw_pose or require_hand_proximity or (not found_high)
     pose_result = None
+    pose_ms = 0.0
+    pose_ran = False
+    proximity_ms = 0.0
+    yolo_low_ms = 0.0
 
     if need_pose:
+        # ── stage 2: MediaPipe pose estimation ──
+        _t = time.time()
         landmarker = PoseEstimator(pose_task_path, vision.RunningMode.IMAGE)
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         pose_result = landmarker.detect_image(frame_rgb)
+        landmarker.close()
+        pose_ms = (time.time() - _t) * 1000
+        pose_ran = True
 
+        # ── stage 3: proximity — hands-near-face check ──
+        _t = time.time()
         suspicious, _best_hand_norm, face_d = ProximityAnalyzer.hands_near_face(
             pose_result, hand_face_thresh
         )
         hand_pts_px = ProximityAnalyzer.get_hand_points_px(pose_result, W, H)
-        landmarker.close()
+        proximity_ms += (time.time() - _t) * 1000
 
     if found_high:
         # phone found at high conf
         if require_hand_proximity and hand_pts_px:
+            # ── stage 3 (cont.): phone-hand proximity ──
+            _t = time.time()
             hand_ok, hand_d = ProximityAnalyzer.phone_close_to_hand(
                 boxes_high, hand_pts_px, W, H, hand_phone_thresh
             )
+            proximity_ms += (time.time() - _t) * 1000
         det_to_plot = det_high
         used_conf = conf_high
         found_low = False
     else:
         # fallback to low conf if pose is suspicious
         if suspicious:
+            # ── stage 1b: YOLO low-confidence inference ──
+            _t = time.time()
             det_low, boxes_low, _ = phone_model.detect(frame_bgr, conf_low)
+            yolo_low_ms = (time.time() - _t) * 1000
             found_low = boxes_low.shape[0] > 0
             det_to_plot = det_low
             used_conf = conf_low
 
             if require_hand_proximity and hand_pts_px and found_low:
+                # ── stage 3 (cont.): phone-hand proximity ──
+                _t = time.time()
                 hand_ok, hand_d = ProximityAnalyzer.phone_close_to_hand(
                     boxes_low, hand_pts_px, W, H, hand_phone_thresh
                 )
+                proximity_ms += (time.time() - _t) * 1000
         else:
             found_low = False
 
+    # ── stage 4: decision logic ──
+    _t = time.time()
     active, reason = DecisionEngine.decide_phone_use(
         found_high=found_high,
         found_low=found_low,
@@ -139,6 +202,7 @@ def _process_single_image_bgr(
         hand_ok=hand_ok,
         require_hand_proximity=require_hand_proximity,
     )
+    decision_ms = (time.time() - _t) * 1000
 
     # draw everything onto the frame
     annotated = det_to_plot.plot()
@@ -161,7 +225,17 @@ def _process_single_image_bgr(
         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
     )
 
-    return annotated, active
+    timing = {
+        "yolo_high_ms": yolo_high_ms,
+        "pose_ms": pose_ms,
+        "pose_ran": pose_ran,
+        "proximity_ms": proximity_ms,
+        "yolo_low_ms": yolo_low_ms,
+        "decision_ms": decision_ms,
+        "total_ms": yolo_high_ms + pose_ms + proximity_ms + yolo_low_ms + decision_ms,
+    }
+
+    return annotated, active, timing
 
 
 # ─── alert sound ───
@@ -1063,22 +1137,385 @@ def load_phone_model(phone_model_path: str) -> PhoneDetector:
     return PhoneDetector(phone_model_path)
 
 
+def _run_evaluation(
+    phone_model_path: str,
+    pose_task_path: str,
+    conf_high: float,
+    conf_low: float,
+    hand_face_thresh: float,
+    hand_phone_thresh: float,
+    require_hand_proximity: bool,
+    draw_pose: bool,
+):
+    import pandas as pd
+    from pathlib import Path
+
+    st.subheader("System Evaluation")
+    st.markdown(
+        "Run the complete Drive Aware pipeline against your labelled test images and record "
+        "classification results. Select one or more YOLO models to compare on the same test set."
+    )
+
+    # ── folder path input ────────────────────────────────────────────────────
+    default_test_dir = str(Path(__file__).resolve().parent / "Testing images")
+    test_dir_input = st.text_input(
+        "Test images folder path",
+        value=default_test_dir,
+        help="Folder containing test images. Images with a matching .txt label file are expected "
+        "to show Phone Use. Images without a label file are expected to show No Phone Use.",
+    )
+
+    test_dir = Path(test_dir_input)
+
+    if not test_dir.is_dir():
+        st.error(f"Folder not found: {test_dir_input}")
+        return
+
+    # ── discover images and determine expected labels ─────────────────────────
+    img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    image_paths = sorted(
+        [p for p in test_dir.iterdir() if p.is_file() and p.suffix.lower() in img_exts],
+        key=lambda p: p.name,
+    )
+
+    if not image_paths:
+        st.warning("No images found in the selected folder.")
+        return
+
+    def get_expected(img_path: Path) -> str:
+        label_path = img_path.with_suffix(".txt")
+        return "Phone Use" if label_path.exists() else "No Phone Use"
+
+    total_images = len(image_paths)
+    phone_count = sum(1 for p in image_paths if get_expected(p) == "Phone Use")
+    no_phone_count = total_images - phone_count
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total images", total_images)
+    col2.metric("Expected Phone Use", phone_count)
+    col3.metric("Expected No Phone Use", no_phone_count)
+
+    st.markdown("---")
+
+    # ── model selection: paths + multiselect ───────────────────────────────────
+    st.subheader("Models to compare")
+
+    with st.expander("Model paths", expanded=False):
+        st.caption("Override the default weight file locations if your models are stored elsewhere.")
+        path_v11 = st.text_input("YOLO v11 weights path", value=EVAL_MODELS["YOLO v11"], key="eval_path_v11")
+        path_v8 = st.text_input("YOLO v8 weights path", value=EVAL_MODELS["YOLO v8"], key="eval_path_v8")
+        path_v5 = st.text_input("YOLO v5 weights path", value=EVAL_MODELS["YOLO v5"], key="eval_path_v5")
+
+    models_to_compare = st.multiselect(
+        "Models to compare",
+        options=["YOLO v11", "YOLO v8", "YOLO v5"],
+        default=["YOLO v11", "YOLO v8", "YOLO v5"],
+        help="Run evaluation for each selected model. Same images and thresholds for all.",
+    )
+
+    path_by_model = {
+        "YOLO v11": path_v11.strip() or EVAL_MODELS["YOLO v11"],
+        "YOLO v8": path_v8.strip() or EVAL_MODELS["YOLO v8"],
+        "YOLO v5": path_v5.strip() or EVAL_MODELS["YOLO v5"],
+    }
+
+    st.markdown("---")
+
+    if "eval_results_by_model" not in st.session_state:
+        st.session_state["eval_results_by_model"] = {}
+    if "eval_timing_by_model" not in st.session_state:
+        st.session_state["eval_timing_by_model"] = {}
+
+    if st.button("Run Evaluation", type="primary"):
+        if not models_to_compare:
+            st.error("Select at least one model to compare.")
+        else:
+            st.session_state["eval_results_by_model"] = {}
+            st.session_state["eval_timing_by_model"] = {}
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            preview_col, _ = st.columns([1, 1])
+            total_models = len(models_to_compare)
+            total_steps = total_models * total_images
+            step = 0
+
+            for model_name in models_to_compare:
+                path = path_by_model[model_name]
+                try:
+                    detector = load_phone_model(path)
+                except Exception as e:
+                    st.error(f"Could not load **{model_name}** from `{path}`: {e}")
+                    continue
+
+                results = []
+                timings = []  # per-image timing dicts collected for this model
+                for i, img_path in enumerate(image_paths):
+                    status_text.text(f"{model_name}: {i + 1}/{total_images} — {img_path.name}")
+                    frame_bgr = cv2.imread(str(img_path))
+                    if frame_bgr is None:
+                        results.append({
+                            "Image": img_path.name,
+                            "Expected": get_expected(img_path),
+                            "Actual": "Error",
+                            "Confidence": "N/A",
+                            "Reason": "Could not read image",
+                            "Inference (ms)": "N/A",
+                            "Correct": "Error",
+                            "Model": model_name,
+                        })
+                        step += 1
+                        progress_bar.progress(step / total_steps)
+                        continue
+
+                    t_start = time.time()
+                    annotated_bgr, active, timing = _process_single_image_bgr(
+                        frame_bgr=frame_bgr,
+                        phone_model=detector,
+                        pose_task_path=pose_task_path,
+                        conf_high=conf_high,
+                        conf_low=conf_low,
+                        hand_face_thresh=hand_face_thresh,
+                        hand_phone_thresh=hand_phone_thresh,
+                        require_hand_proximity=require_hand_proximity,
+                        draw_pose=draw_pose,
+                    )
+                    inference_ms = (time.time() - t_start) * 1000
+                    timings.append(timing)
+                    expected = get_expected(img_path)
+                    actual = "Phone Use" if active else "No Phone Use"
+                    correct = "Yes" if expected == actual else "No"
+
+                    H, W = frame_bgr.shape[:2]
+                    det_high, boxes_high, confs_high = detector.detect(frame_bgr, conf_high)
+                    found_high = boxes_high.shape[0] > 0
+                    if found_high and len(confs_high) > 0:
+                        conf_val = f"{float(confs_high[0]):.2f}"
+                        reason_val = "HighConf phone"
+                    else:
+                        conf_val = f"{conf_high:.2f}"
+                        reason_val = "No high-conf detection"
+
+                    results.append({
+                        "Image": img_path.name,
+                        "Expected": expected,
+                        "Actual": actual,
+                        "Confidence": conf_val,
+                        "Reason": reason_val,
+                        "Inference (ms)": f"{inference_ms:.0f}",
+                        "Correct": correct,
+                        "Model": model_name,
+                    })
+
+                    if i % 5 == 0 and model_name == models_to_compare[0]:
+                        annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+                        preview_col.image(
+                            annotated_rgb,
+                            caption=f"{img_path.name} | {model_name} | {actual}",
+                            use_container_width=True,
+                        )
+                    step += 1
+                    progress_bar.progress(step / total_steps)
+
+                st.session_state["eval_results_by_model"][model_name] = results
+                st.session_state["eval_timing_by_model"][model_name] = timings
+
+            status_text.text("Evaluation complete.")
+
+    # ── display comparison if available ──────────────────────────────────────
+    if st.session_state["eval_results_by_model"]:
+        results_by_model = st.session_state["eval_results_by_model"]
+        model_names = list(results_by_model.keys())
+
+        # pre-compute summary rows (shared across sub-tabs)
+        summary_rows = []
+        for model_name in model_names:
+            df = pd.DataFrame(results_by_model[model_name])
+            total = len(df)
+            correct_count = len(df[df["Correct"] == "Yes"])
+            incorrect_count = len(df[df["Correct"] == "No"])
+            # accuracy = (TP + TN) / total — proportion of all predictions that are correct
+            accuracy = correct_count / total if total > 0 else 0.0
+            # confusion matrix counts
+            tp = len(df[(df["Expected"] == "Phone Use") & (df["Actual"] == "Phone Use")])   # correctly flagged
+            fp = len(df[(df["Expected"] == "No Phone Use") & (df["Actual"] == "Phone Use")]) # false alarm
+            fn = len(df[(df["Expected"] == "Phone Use") & (df["Actual"] == "No Phone Use")]) # missed detection
+            tn = len(df[(df["Expected"] == "No Phone Use") & (df["Actual"] == "No Phone Use")]) # correctly clear
+            # precision = TP / (TP + FP) — of all "phone use" predictions, how many were correct
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            # recall = TP / (TP + FN) — of all actual phone-use cases, how many did we catch
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            # F1 = 2 * (precision * recall) / (precision + recall) — harmonic mean, balances both
+            f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+            try:
+                avg_ms = df["Inference (ms)"].replace("N/A", np.nan).astype(float).mean()
+            except Exception:
+                avg_ms = float("nan")
+            summary_rows.append({
+                "Model": model_name,
+                "Accuracy": f"{accuracy:.1%}",
+                "Precision": f"{precision:.1%}",
+                "Recall": f"{recall:.1%}",
+                "F1 Score": f"{f1:.1%}",
+                "Avg inference (ms)": f"{avg_ms:.0f}" if not np.isnan(avg_ms) else "N/A",
+                "Correct": correct_count,
+                "Incorrect": incorrect_count,
+            })
+
+        res_tab_summary, res_tab_timing, res_tab_perim, res_tab_errors = st.tabs(
+            ["Summary", "Stage Timing", "Per-image Results", "Errors"]
+        )
+
+        # ── Summary sub-tab ──
+        with res_tab_summary:
+            st.subheader("Summary comparison")
+            summary_df = pd.DataFrame(summary_rows)
+            st.dataframe(summary_df.set_index("Model"), use_container_width=True, height=120)
+
+            st.markdown("---")
+            all_rows = []
+            for model_name in model_names:
+                for r in results_by_model[model_name]:
+                    all_rows.append(r)
+            combined_df = pd.DataFrame(all_rows)
+            csv_bytes = combined_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="Download all results as CSV (with Model column)",
+                data=csv_bytes,
+                file_name="driveaware_evaluation_comparison.csv",
+                mime="text/csv",
+            )
+            total = len(combined_df)
+            correct_total = len(combined_df[combined_df["Correct"] == "Yes"])
+            st.caption(f"Evaluation ran on {len(model_names)} model(s) × {total_images} images | Total rows: {total} | Correct: {correct_total}")
+
+        # ── Stage Timing sub-tab ──
+        with res_tab_timing:
+            st.subheader("Stage timing breakdown")
+            st.caption(
+                "Average milliseconds per pipeline stage across all test images. "
+                "MediaPipe (conditional) averages only over images where pose estimation actually ran "
+                "(skipped when YOLO fires at high confidence). "
+                "Total (stages) is the sum of all timed stages; Wall-clock is the outer timer "
+                "that wraps the whole function — any gap indicates overhead outside the four stages "
+                "(e.g. image loading, BGR conversion, annotation drawing)."
+            )
+            timing_rows = []
+            timing_by_model = st.session_state.get("eval_timing_by_model", {})
+            for mn in model_names:
+                t_list = timing_by_model.get(mn, [])
+                if not t_list:
+                    continue
+                n = len(t_list)
+                pose_ran_list = [t["pose_ms"] for t in t_list if t["pose_ran"]]
+
+                avg = lambda key: sum(t[key] for t in t_list) / n  # noqa: E731
+                timing_rows.append({
+                    "Model": mn,
+                    "YOLO high-conf (ms)": f"{avg('yolo_high_ms'):.1f}",
+                    "YOLO low-conf (ms)": f"{avg('yolo_low_ms'):.1f}",
+                    "MediaPipe — all images (ms)": f"{avg('pose_ms'):.1f}",
+                    "MediaPipe — when ran (ms)": f"{sum(pose_ran_list) / len(pose_ran_list):.1f}" if pose_ran_list else "N/A",
+                    "Proximity (ms)": f"{avg('proximity_ms'):.1f}",
+                    "Decision (ms)": f"{avg('decision_ms'):.1f}",
+                    "Total stages (ms)": f"{avg('total_ms'):.1f}",
+                    "Images with pose": f"{len(pose_ran_list)}/{n}",
+                })
+            if timing_rows:
+                timing_df = pd.DataFrame(timing_rows)
+                st.dataframe(timing_df.set_index("Model"), use_container_width=True)
+            else:
+                st.info("Run evaluation to see stage timing data.")
+
+        # ── Per-image Results sub-tab ──
+        with res_tab_perim:
+            st.subheader("Per-image comparison")
+            first_model = model_names[0]
+            base = results_by_model[first_model]
+            comp_dict = {
+                "Image": [r["Image"] for r in base],
+                "Expected": [r["Expected"] for r in base],
+            }
+            for mn in model_names:
+                comp_dict[f"Actual ({mn})"] = [r["Actual"] for r in results_by_model[mn]]
+                comp_dict[f"Correct ({mn})"] = [r["Correct"] for r in results_by_model[mn]]
+            comp_df = pd.DataFrame(comp_dict)
+            st.dataframe(comp_df, use_container_width=True, height=400)
+
+            st.markdown("---")
+            for model_name in model_names:
+                df = pd.DataFrame(results_by_model[model_name])
+                with st.expander(f"Full results: {model_name}"):
+                    def highlight_correct(row):
+                        if row.get("Correct") == "Yes":
+                            return ["background-color: #d4edda"] * len(row)
+                        if row.get("Correct") == "No":
+                            return ["background-color: #f8d7da"] * len(row)
+                        return [""] * len(row)
+                    cols_show = [c for c in df.columns if c != "Model"]
+                    st.dataframe(df[cols_show].style.apply(highlight_correct, axis=1), use_container_width=True, height=300)
+
+        # ── Errors sub-tab ──
+        with res_tab_errors:
+            st.subheader("Incorrect predictions")
+            st.caption(
+                "Rows where the model predicted wrong. Expand a model to see only its incorrect cases, "
+                "and click an image to view it."
+            )
+            cols_incorrect = ["Image", "Expected", "Actual", "Confidence", "Reason", "Inference (ms)"]
+            for model_name in model_names:
+                df = pd.DataFrame(results_by_model[model_name])
+                incorrect_df = df[df["Correct"] == "No"]
+                if incorrect_df.empty:
+                    st.write(f"**{model_name}**: No incorrect predictions.")
+                else:
+                    with st.expander(f"{model_name} — {len(incorrect_df)} incorrect"):
+                        cols_show = [c for c in cols_incorrect if c in incorrect_df.columns]
+                        st.dataframe(
+                            incorrect_df[cols_show],
+                            use_container_width=True,
+                            height=min(260, 50 + 30 * len(incorrect_df)),
+                        )
+
+                        st.markdown("Click an image row below to view the corresponding photo.")
+                        for _, row in incorrect_df.iterrows():
+                            img_name = row.get("Image")
+                            if not img_name:
+                                continue
+                            img_path = test_dir / img_name
+                            with st.expander(
+                                f"{img_name} — Expected: {row.get('Expected')} | Actual: {row.get('Actual')}"
+                            ):
+                                frame_bgr = cv2.imread(str(img_path))
+                                if frame_bgr is None:
+                                    st.warning(f"Could not read image: {img_name}")
+                                else:
+                                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                                    st.image(
+                                        frame_rgb,
+                                        caption=(
+                                            f"{img_name} | {model_name} | "
+                                            f"Expected: {row.get('Expected')} | Actual: {row.get('Actual')}"
+                                        ),
+                                        use_container_width=True,
+                                    )
+
+
 # ─── main streamlit app ───
 
 def main():
     st.set_page_config(
-        page_title="Phone Usage Detector (YOLO + MediaPipe)",
+        page_title="Drive Aware",
         layout="wide",
     )
 
-    st.title("Phone Usage Detector")
+    st.title("Drive Aware")
     st.markdown(
-        "Fusion of **YOLO phone detection** with **MediaPipe pose landmarks** "
-        "for more robust 'phone use' detection."
+        "AI-based computer vision system for detecting mobile phone use while driving."
     )
 
     # sidebar settings
     with st.sidebar:
+        st.markdown("## Drive Aware")
         st.header("Settings")
 
         default_phone_model = "weights/best.pt"
@@ -1088,10 +1525,22 @@ def main():
         pose_task_path = st.text_input("MediaPipe pose .task path", default_pose_task)
 
         st.subheader("Thresholds")
-        conf_high = st.slider("YOLO conf (normal)", 0.0, 1.0, 0.75, 0.01)
-        conf_low = st.slider("YOLO conf (when suspicious)", 0.0, 1.0, 0.25, 0.01)
-        hand_face_thresh = st.slider("Hand–face distance (normalized)", 0.05, 0.5, 0.18, 0.01)
-        hand_phone_thresh = st.slider("Phone–hand distance (normalized)", 0.05, 0.5, 0.12, 0.01)
+        conf_high = st.slider(
+            "YOLO conf (normal)", 0.0, 1.0, 0.75, 0.01,
+            help="Minimum confidence for the detector to flag a phone. Higher = fewer false alarms.",
+        )
+        conf_low = st.slider(
+            "YOLO conf (when suspicious)", 0.0, 1.0, 0.25, 0.01,
+            help="Fallback confidence used only when the pose looks suspicious. Lower catches more borderline cases.",
+        )
+        hand_face_thresh = st.slider(
+            "Hand–face distance (normalized)", 0.05, 0.5, 0.18, 0.01,
+            help="How close a hand must be to the face to count as suspicious. Higher = more sensitive.",
+        )
+        hand_phone_thresh = st.slider(
+            "Phone–hand distance (normalized)", 0.05, 0.5, 0.12, 0.01,
+            help="How close a detected phone must be to a hand. Only used when hand-proximity filtering is on.",
+        )
 
         st.subheader("Logic & Visuals")
         require_hand_proximity = st.checkbox(
@@ -1100,49 +1549,53 @@ def main():
         )
         draw_pose = st.checkbox("Draw pose skeleton", value=True)
 
-    # input mode selector
-    mode = st.radio(
-        "Choose input mode",
-        ["Upload image(s)", "Upload video", "Live webcam (external window)"],
-        help="Upload lets you test your own images or videos. Live mode streams directly from your webcam.",
-    )
-
-    # load yolo model (cached)
+    # load yolo model (cached) — done before tabs so errors surface immediately
     try:
         phone_model = load_phone_model(phone_model_path)
     except Exception as e:
         st.error(f"Could not load YOLO model from `{phone_model_path}`.\n\nError: {e}")
         return
 
-    # ── image mode (take photo, upload, or sample images) ──
-    if mode == "Upload image(s)":
-        st.subheader("Take a photo or upload images")
+    tab_img, tab_vid, tab_live, tab_eval = st.tabs(
+        ["Image Analysis", "Video Analysis", "Live Webcam", "Evaluation"]
+    )
+
+    # ── Image Analysis tab ──
+    with tab_img:
+        st.subheader("Image Analysis")
         image_source = st.radio(
             "Image source",
-            ["Take a photo", "Upload image(s)", "Choose from sample images"],
-            help="Use your camera, upload files, or pick from sample images to test.",
+            ["Upload image(s)", "Choose from sample images", "Take a photo"],
+            help="Upload your own files, pick from sample images, or use your camera.",
         )
 
-        if image_source == "Take a photo":
-            cam_img = st.camera_input("Take a photo to analyse")
-            if cam_img is not None:
-                with st.spinner("Running detection..."):
-                    pil_img = Image.open(cam_img).convert("RGB")
-                    frame_rgb = np.array(pil_img)
-                    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                    annotated_bgr, _ = _process_single_image_bgr(
-                        frame_bgr=frame_bgr,
-                        phone_model=phone_model,
-                        pose_task_path=pose_task_path,
-                        conf_high=conf_high,
-                        conf_low=conf_low,
-                        hand_face_thresh=hand_face_thresh,
-                        hand_phone_thresh=hand_phone_thresh,
-                        require_hand_proximity=require_hand_proximity,
-                        draw_pose=draw_pose,
-                    )
-                    annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-                    st.image(annotated_rgb, caption="Detection result", use_container_width=True)
+        if image_source == "Upload image(s)":
+            uploaded_files = st.file_uploader(
+                "Upload one or more images",
+                type=["jpg", "jpeg", "png", "bmp", "webp"],
+                accept_multiple_files=True,
+            )
+
+            if uploaded_files:
+                for up in uploaded_files:
+                    st.markdown(f"**File:** `{up.name}`")
+                    with st.spinner(f"Processing {up.name}..."):
+                        pil_img = Image.open(up).convert("RGB")
+                        frame_rgb = np.array(pil_img)
+                        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                        annotated_bgr, _, _ = _process_single_image_bgr(
+                            frame_bgr=frame_bgr,
+                            phone_model=phone_model,
+                            pose_task_path=pose_task_path,
+                            conf_high=conf_high,
+                            conf_low=conf_low,
+                            hand_face_thresh=hand_face_thresh,
+                            hand_phone_thresh=hand_phone_thresh,
+                            require_hand_proximity=require_hand_proximity,
+                            draw_pose=draw_pose,
+                        )
+                        annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+                        st.image(annotated_rgb, caption=f"Detection result - {up.name}", use_container_width=True)
 
         elif image_source == "Choose from sample images":
             samples = _get_sample_images_with_labels()
@@ -1183,7 +1636,7 @@ def main():
                             if frame_bgr is None:
                                 st.warning(f"Could not read image: {label}")
                                 continue
-                            annotated_bgr, _ = _process_single_image_bgr(
+                            annotated_bgr, _, _ = _process_single_image_bgr(
                                 frame_bgr=frame_bgr,
                                 phone_model=phone_model,
                                 pose_task_path=pose_task_path,
@@ -1197,22 +1650,88 @@ def main():
                             annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
                             st.image(annotated_rgb, caption=f"Detection result — {label}", use_container_width=True)
 
-        else:
-            uploaded_files = st.file_uploader(
-                "Upload one or more images",
-                type=["jpg", "jpeg", "png", "bmp", "webp"],
-                accept_multiple_files=True,
+        else:  # Take a photo
+            cam_img = st.camera_input("Take a photo to analyse")
+            if cam_img is not None:
+                with st.spinner("Running detection..."):
+                    pil_img = Image.open(cam_img).convert("RGB")
+                    frame_rgb = np.array(pil_img)
+                    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                    annotated_bgr, _, _ = _process_single_image_bgr(
+                        frame_bgr=frame_bgr,
+                        phone_model=phone_model,
+                        pose_task_path=pose_task_path,
+                        conf_high=conf_high,
+                        conf_low=conf_low,
+                        hand_face_thresh=hand_face_thresh,
+                        hand_phone_thresh=hand_phone_thresh,
+                        require_hand_proximity=require_hand_proximity,
+                        draw_pose=draw_pose,
+                    )
+                    annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+                    st.image(annotated_rgb, caption="Detection result", use_container_width=True)
+
+    # ── Video Analysis tab ──
+    with tab_vid:
+        st.subheader("Video Analysis")
+        st.markdown(
+            "Upload a video or choose from sample clips to analyse. "
+            "The system will identify periods of active phone use and generate a safety report."
+        )
+
+        video_source = st.radio(
+            "Video source",
+            ["Upload video", "Choose from sample videos"],
+        )
+
+        progress_placeholder = st.empty()
+        status_placeholder = st.empty()
+        frame_placeholder = st.empty()
+        report_placeholder = st.empty()
+
+        if video_source == "Upload video":
+            video_file = st.file_uploader(
+                "Upload a video file",
+                type=["mp4", "mov", "avi", "mkv", "webm"],
+                accept_multiple_files=False,
             )
 
-            if uploaded_files:
-                for up in uploaded_files:
-                    st.markdown(f"**File:** `{up.name}`")
-                    with st.spinner(f"Processing {up.name}..."):
-                        pil_img = Image.open(up).convert("RGB")
-                        frame_rgb = np.array(pil_img)
-                        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                        annotated_bgr, _ = _process_single_image_bgr(
-                            frame_bgr=frame_bgr,
+            if video_file is not None and st.button("Start video analysis"):
+                with st.spinner("Analysing video. This may take a while for long files."):
+                    _analyze_video_file_streamlit(
+                        uploaded_file=video_file,
+                        phone_model=phone_model,
+                        pose_task_path=pose_task_path,
+                        conf_high=conf_high,
+                        conf_low=conf_low,
+                        hand_face_thresh=hand_face_thresh,
+                        hand_phone_thresh=hand_phone_thresh,
+                        require_hand_proximity=require_hand_proximity,
+                        draw_pose=draw_pose,
+                        progress_placeholder=progress_placeholder,
+                        status_placeholder=status_placeholder,
+                        frame_placeholder=frame_placeholder,
+                        report_placeholder=report_placeholder,
+                    )
+
+        else:  # Choose from sample videos
+            sample_videos = _get_sample_videos_with_labels()
+            if not sample_videos:
+                st.info("No sample videos available.")
+            else:
+                video_labels = [label for _, label in sample_videos]
+                video_path_by_label = {label: path for path, label in sample_videos}
+
+                selected_video = st.selectbox(
+                    "Select a sample video to analyse",
+                    video_labels,
+                    help=f"{len(video_labels)} sample video(s) available.",
+                )
+                if selected_video and st.button("Analyse selected video"):
+                    video_path = video_path_by_label[selected_video]
+                    with st.spinner(f"Analysing {selected_video}..."):
+                        _analyze_video_file_streamlit(
+                            uploaded_file=_SampleVideo(video_path),
                             phone_model=phone_model,
                             pose_task_path=pose_task_path,
                             conf_high=conf_high,
@@ -1221,47 +1740,11 @@ def main():
                             hand_phone_thresh=hand_phone_thresh,
                             require_hand_proximity=require_hand_proximity,
                             draw_pose=draw_pose,
+                            progress_placeholder=progress_placeholder,
+                            status_placeholder=status_placeholder,
+                            frame_placeholder=frame_placeholder,
+                            report_placeholder=report_placeholder,
                         )
-                        annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-                        st.image(annotated_rgb, caption=f"Detection result - {up.name}", use_container_width=True)
-
-    # ── video mode (take video then upload, or upload) ──
-    elif mode == "Upload video":
-        st.subheader("Take a video or upload one")
-        st.markdown(
-            "**Take a video** on your phone or device, then **upload it** below. "
-            "Or choose an existing video file. The system will analyse the entire video, "
-            "identify periods of active phone use, and generate a drive-style report at the end."
-        )
-
-        video_file = st.file_uploader(
-            "Upload a video file (e.g. one you just recorded)",
-            type=["mp4", "mov", "avi", "mkv", "webm"],
-            accept_multiple_files=False,
-        )
-
-        progress_placeholder = st.empty()
-        status_placeholder = st.empty()
-        frame_placeholder = st.empty()
-        report_placeholder = st.empty()
-
-        if video_file is not None and st.button("Start video analysis"):
-            with st.spinner("Analysing video. This may take a while for long files."):
-                _analyze_video_file_streamlit(
-                    uploaded_file=video_file,
-                    phone_model=phone_model,
-                    pose_task_path=pose_task_path,
-                    conf_high=conf_high,
-                    conf_low=conf_low,
-                    hand_face_thresh=hand_face_thresh,
-                    hand_phone_thresh=hand_phone_thresh,
-                    require_hand_proximity=require_hand_proximity,
-                    draw_pose=draw_pose,
-                    progress_placeholder=progress_placeholder,
-                    status_placeholder=status_placeholder,
-                    frame_placeholder=frame_placeholder,
-                    report_placeholder=report_placeholder,
-                )
 
         # offer pdf download if report exists
         if REPORTLAB_AVAILABLE and "drive_report_data" in st.session_state:
@@ -1272,23 +1755,23 @@ def main():
                 data=pdf_bytes,
                 file_name="drive_report.pdf",
                 mime="application/pdf",
+                key="pdf_download_video",
             )
         elif "drive_report_data" in st.session_state and not REPORTLAB_AVAILABLE:
             st.info("To enable PDF downloads, install reportlab: pip install reportlab")
 
-    # ── live webcam mode ──
-    elif mode == "Live webcam (external window)":
-        st.subheader("Live webcam")
+    # ── Live Webcam tab ──
+    with tab_live:
+        st.subheader("Live Webcam")
         st.markdown(
-            "- Click **Start live detection** to stream frames in this page.\n"
-            "- The session stops automatically after the selected time limit.\n"
-            "- If the phone is **ACTIVE** for more than **5 frames in a row**, the overlay shows "
-            "*PHONE ACTIVE (5+ frames)* and your machine plays a sound."
+            "Click **Start live detection** to begin streaming from your webcam. "
+            "The session ends automatically after the selected time limit. "
+            "Sustained phone use triggers a visual alert and an audio notification."
         )
 
         max_seconds = st.slider(
             "Max live duration (seconds)", 5, 300, 60, 5,
-            help="Safety limit for the live loop."
+            help="The webcam session stops automatically after this many seconds.",
         )
         frame_placeholder = st.empty()
         info_placeholder = st.empty()
@@ -1319,9 +1802,23 @@ def main():
                 data=pdf_bytes,
                 file_name="drive_report.pdf",
                 mime="application/pdf",
+                key="pdf_download_webcam",
             )
         elif "drive_report_data" in st.session_state and not REPORTLAB_AVAILABLE:
             st.info("To enable PDF downloads, install reportlab: pip install reportlab")
+
+    # ── Evaluation tab ──
+    with tab_eval:
+        _run_evaluation(
+            phone_model_path=phone_model_path,
+            pose_task_path=pose_task_path,
+            conf_high=conf_high,
+            conf_low=conf_low,
+            hand_face_thresh=hand_face_thresh,
+            hand_phone_thresh=hand_phone_thresh,
+            require_hand_proximity=require_hand_proximity,
+            draw_pose=draw_pose,
+        )
 
 
 if __name__ == "__main__":
