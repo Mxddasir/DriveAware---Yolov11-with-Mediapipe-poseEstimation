@@ -111,8 +111,8 @@ def _get_sample_videos_with_labels() -> List[Tuple[Path, str]]:
 
 
 class _SampleVideo:
-    """Thin adapter so a Path can be passed to _analyze_video_file_streamlit unchanged.
-    Mimics the .name and .getvalue() interface of st.UploadedFile."""
+    # wraps a Path so it looks like an uploaded file to _analyze_video_file_streamlit
+    # (which expects .name and .getvalue())
 
     def __init__(self, path: Path):
         self.name = path.name
@@ -122,7 +122,8 @@ class _SampleVideo:
         return self._path.read_bytes()
 
 
-# ─── single image pipeline (streamlit version, no cv2 windows) ───
+# single image pipeline — takes a BGR numpy array, runs the full detection pipeline,
+# returns (annotated_bgr, is_active, timing_dict)
 
 def _process_single_image_bgr(
     frame_bgr: np.ndarray,
@@ -137,13 +138,13 @@ def _process_single_image_bgr(
 ):
     H, W = frame_bgr.shape[:2]
 
-    # ── stage 1: YOLO high-confidence inference ──
+    # first pass: YOLO at high confidence
     _t = time.time()
     det_high, boxes_high, _ = phone_model.detect(frame_bgr, conf_high)
     yolo_high_ms = (time.time() - _t) * 1000
     found_high = boxes_high.shape[0] > 0
 
-    # defaults
+    # defaults — overwritten below if pose runs
     suspicious = False
     face_d = 999.0
     hand_pts_px: List[tuple[int, int]] = []
@@ -152,6 +153,7 @@ def _process_single_image_bgr(
     used_conf = conf_high
     det_to_plot = det_high
 
+    # pose only runs when needed: drawing requested, hand filter on, or YOLO missed
     need_pose = draw_pose or require_hand_proximity or (not found_high)
     pose_result = None
     pose_ms = 0.0
@@ -160,7 +162,7 @@ def _process_single_image_bgr(
     yolo_low_ms = 0.0
 
     if need_pose:
-        # ── stage 2: MediaPipe pose estimation ──
+        # run MediaPipe BlazePose to get body landmarks
         _t = time.time()
         landmarker = PoseEstimator(pose_task_path, vision.RunningMode.IMAGE)
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -169,7 +171,7 @@ def _process_single_image_bgr(
         pose_ms = (time.time() - _t) * 1000
         pose_ran = True
 
-        # ── stage 3: proximity — hands-near-face check ──
+        # check if any hand landmark is close to the face
         _t = time.time()
         suspicious, _best_hand_norm, face_d = ProximityAnalyzer.hands_near_face(
             pose_result, hand_face_thresh
@@ -178,9 +180,8 @@ def _process_single_image_bgr(
         proximity_ms += (time.time() - _t) * 1000
 
     if found_high:
-        # phone found at high conf
+        # phone found with high confidence — optionally check it's near a hand
         if require_hand_proximity and hand_pts_px:
-            # ── stage 3 (cont.): phone-hand proximity ──
             _t = time.time()
             hand_ok, hand_d = ProximityAnalyzer.phone_close_to_hand(
                 boxes_high, hand_pts_px, W, H, hand_phone_thresh
@@ -190,9 +191,8 @@ def _process_single_image_bgr(
         used_conf = conf_high
         found_low = False
     else:
-        # fallback to low conf if pose is suspicious
+        # YOLO missed at high conf — try again at low conf only if pose looks suspicious
         if suspicious:
-            # ── stage 1b: YOLO low-confidence inference ──
             _t = time.time()
             det_low, boxes_low, _ = phone_model.detect(frame_bgr, conf_low)
             yolo_low_ms = (time.time() - _t) * 1000
@@ -201,7 +201,6 @@ def _process_single_image_bgr(
             used_conf = conf_low
 
             if require_hand_proximity and hand_pts_px and found_low:
-                # ── stage 3 (cont.): phone-hand proximity ──
                 _t = time.time()
                 hand_ok, hand_d = ProximityAnalyzer.phone_close_to_hand(
                     boxes_low, hand_pts_px, W, H, hand_phone_thresh
@@ -210,7 +209,7 @@ def _process_single_image_bgr(
         else:
             found_low = False
 
-    # ── stage 4: decision logic ──
+    # final decision: active or not
     _t = time.time()
     active, reason = DecisionEngine.decide_phone_use(
         found_high=found_high,
@@ -237,11 +236,6 @@ def _process_single_image_bgr(
         hand_dist=hand_d,
     )
 
-    cv2.putText(
-        annotated, "Streamlit single-image mode", (15, 105),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
-    )
-
     timing = {
         "yolo_high_ms": yolo_high_ms,
         "pose_ms": pose_ms,
@@ -255,10 +249,8 @@ def _process_single_image_bgr(
     return annotated, active, timing
 
 
-# ─── alert sound ───
-
 def _play_alert_sound():
-    # tries to play a sound when phone is detected - different per OS
+    # sound output varies by OS; failures are silently ignored
     system = platform.system()
     try:
         if system == "Darwin":
@@ -271,8 +263,6 @@ def _play_alert_sound():
     except Exception:
         pass
 
-
-# ─── report helpers ───
 
 def _format_duration(seconds: float) -> str:
     seconds = max(0, int(seconds))
@@ -288,20 +278,20 @@ def _prepare_report_data(
     session_end: datetime,
     incidents: List[Tuple[datetime, datetime]],
 ):
-    # crunch all the numbers for the drive report
+    # calculate totals and safety score from the incident list
 
     total_duration_s = (session_end - session_start).total_seconds()
     phone_use_s = sum((end - start).total_seconds() for start, end in incidents if end > start)
     phone_use_pct = (phone_use_s / total_duration_s * 100) if total_duration_s > 0 else 0.0
 
-    # safety score: 100 = no phone use, goes down the more you use it
+    # 100 = no phone use; score drops by 1.2x the usage percentage, minimum 0
     safety_score = int(max(0, 100 - phone_use_pct * 1.2))
 
     date_str = session_start.strftime("%B %d, %Y")
     start_time_str = session_start.strftime("%H:%M:%S")
     duration_str = _format_duration(total_duration_s)
 
-    # build incident list with formatted info
+    # build a list of incidents with timestamps and durations
     incident_items = []
     for idx, (start, end) in enumerate(incidents, start=1):
         dur_s = max(0, (end - start).total_seconds())
@@ -315,7 +305,7 @@ def _prepare_report_data(
         }
         incident_items.append(item)
 
-    # text-based timeline bars for the markdown report
+    # text bar chart for the markdown report — length scaled to the longest incident
     timeline_bars = ""
     timeline_segments = []
     if incident_items:
@@ -335,7 +325,7 @@ def _prepare_report_data(
     else:
         timeline_bars = "No incidents recorded."
 
-    # pick an insight message based on how much phone use there was
+    # choose an insight message based on severity of phone use
     if phone_use_s == 0:
         insights = (
             "No phone use was detected during this session. This is the safest possible behaviour. "
@@ -360,7 +350,7 @@ def _prepare_report_data(
             "as a serious warning and take concrete steps to remove the phone from your driving routine."
         )
 
-    # recommendations for the pdf report
+    # structured list used in the PDF; plain markdown version used in the Streamlit report
     recommendations_list = [
         {
             "title": "Pattern Analysis",
@@ -410,10 +400,10 @@ def _prepare_report_data(
     return report_data
 
 
-# ─── pdf generation ───
+# builds a formatted PDF report using reportlab
 
 def _build_pdf_from_report_data(report_data: dict) -> bytes:
-    # builds a nice looking pdf report using reportlab
+    # all drawing is done with reportlab primitives; returns the PDF as bytes
 
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
@@ -672,7 +662,7 @@ def _build_pdf_from_report_data(report_data: dict) -> bytes:
     return buffer.getvalue()
 
 
-# ─── markdown report renderer ───
+# renders the drive report as markdown into a Streamlit placeholder
 
 def _render_drive_report(
     report_placeholder,
@@ -732,7 +722,7 @@ def _render_drive_report(
     return report_data
 
 
-# ─── live webcam loop ───
+# reads frames from the webcam and runs detection until the time limit is reached
 
 def _run_live_webcam_streamlit(
     phone_model: YOLO,
@@ -937,7 +927,7 @@ def _run_live_webcam_streamlit(
         st.session_state["drive_report_data"] = report_data
 
 
-# ─── video file analysis ───
+# processes an uploaded video file frame by frame and streams progress to Streamlit
 
 def _analyze_video_file_streamlit(
     uploaded_file,
@@ -954,7 +944,7 @@ def _analyze_video_file_streamlit(
     frame_placeholder,
     report_placeholder,
 ):
-    # save the upload to a temp file so opencv can read it
+    # OpenCV needs a real file path, so write the upload to a temp file first
     suffix = Path(uploaded_file.name).suffix or ".mp4"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded_file.getvalue())
@@ -1090,7 +1080,7 @@ def _analyze_video_file_streamlit(
                 hand_dist=hand_d,
             )
 
-            # show a preview frame every half second or so
+            # update the preview roughly every half second to avoid flooding the UI
             if frame_idx % max(1, int(fps // 2)) == 0:
                 annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
                 frame_placeholder.image(
@@ -1118,7 +1108,7 @@ def _analyze_video_file_streamlit(
         if incident_active and incident_start_s is not None and last_active_s is not None:
             incidents_s.append((incident_start_s, last_active_s))
 
-        # convert second-based incidents to datetimes for the report
+        # incidents are tracked in video-seconds; convert to datetimes for the report functions
         if total_frames > 0:
             total_duration_s = total_frames / fps
         else:
@@ -1147,7 +1137,7 @@ def _analyze_video_file_streamlit(
             pass
 
 
-# ─── model loading (cached so it only loads once) ───
+# cached so the model is only loaded once per session, not on every page rerun
 
 @st.cache_resource(show_spinner="Loading YOLO phone model...")
 def load_phone_model(phone_model_path: str) -> PhoneDetector:
@@ -1599,7 +1589,7 @@ def _run_evaluation(
                                     )
 
 
-# ─── main streamlit app ───
+# entry point — sets up the page, sidebar, and the four main tabs
 
 def main():
     st.set_page_config(
@@ -1612,7 +1602,7 @@ def main():
         "AI-based computer vision system for detecting mobile phone use while driving."
     )
 
-    # sidebar settings
+    # all detection parameters are controlled from the sidebar
     with st.sidebar:
         st.markdown("## Drive Aware")
         st.header("Settings")
@@ -1648,7 +1638,7 @@ def main():
         )
         draw_pose = st.checkbox("Draw pose skeleton", value=True)
 
-    # load yolo model (cached) — done before tabs so errors surface immediately
+    # load the model before setting up tabs so any path error shows at the top
     try:
         phone_model = load_phone_model(phone_model_path)
     except Exception as e:
